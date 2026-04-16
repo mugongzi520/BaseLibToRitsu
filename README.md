@@ -21,7 +21,7 @@
 ## 发布包内容
 
 - `Convert-BaseLibToRitsuLib.ps1`
-- `Invoke-BaseLibToRitsuMigration.ps1`
+- `BaseLibToRitsu.ps1`
 - `BaseLibToRitsuCompatibility.template.cs`
 - `BaseLibToRitsuMigrationSupport.template.cs`
 - `BaseLibToRitsu-使用说明.md`
@@ -32,7 +32,7 @@
 
 直接打开：
 
-- `tools\Invoke-BaseLibToRitsuMigration.ps1`
+- `BaseLibToRitsu.ps1`
 
 然后按提示输入：
 
