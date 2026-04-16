@@ -30,6 +30,12 @@
 
 ### 0. 懒人版入口
 
+先配置脚本环境 把里面的
+BaseLib 目录
+RitsuLib 目录
+Godot mono exe
+换成你的路径
+
 直接打开：
 
 - `BaseLibToRitsu.ps1`
