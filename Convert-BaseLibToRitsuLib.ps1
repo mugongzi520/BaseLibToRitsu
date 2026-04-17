@@ -3,9 +3,9 @@ param(
     [Parameter(Mandatory)]
     [string]$ProjectRoot,
 
-    [string]$OldLibRoot = "D:\mod\ctf9\BaseLib-StS2-master",
+    [string]$OldLibRoot,
 
-    [string]$NewLibRoot = "D:\mod\ctf9\STS2-RitsuLib-main",
+    [string]$NewLibRoot,
 
     [string]$ReportPath,
 
@@ -39,6 +39,137 @@ function Resolve-FullPath {
     )
 
     return (Resolve-Path -LiteralPath $Path).Path
+}
+
+function Resolve-ExistingDirectory {
+    param(
+        [string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $null
+    }
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+        return $null
+    }
+
+    return (Resolve-Path -LiteralPath $Path).Path
+}
+
+function Test-IsRitsuLibRoot {
+    param(
+        [string]$Path
+    )
+
+    $resolved = Resolve-ExistingDirectory -Path $Path
+    if (-not $resolved) {
+        return $false
+    }
+
+    $csprojFiles = @(Get-ChildItem -LiteralPath $resolved -Filter "*.csproj" -File -ErrorAction SilentlyContinue)
+    if ($csprojFiles | Where-Object { $_.BaseName -match 'RitsuLib' }) {
+        return $true
+    }
+
+    return (Test-Path -LiteralPath (Join-Path $resolved "mod_manifest.json"))
+}
+
+function Test-IsBaseLibRoot {
+    param(
+        [string]$Path
+    )
+
+    $resolved = Resolve-ExistingDirectory -Path $Path
+    if (-not $resolved) {
+        return $false
+    }
+
+    if (Test-Path -LiteralPath (Join-Path $resolved "BaseLib.csproj")) {
+        return $true
+    }
+
+    $csprojFiles = @(Get-ChildItem -LiteralPath $resolved -Filter "*.csproj" -File -ErrorAction SilentlyContinue)
+    return [bool]($csprojFiles | Where-Object { $_.BaseName -match 'BaseLib' })
+}
+
+function Get-BundledLibraryRoot {
+    param(
+        [string]$RequestedPath,
+        [string[]]$CandidateDirectoryNames,
+        [scriptblock]$Validator,
+        [string]$ParameterName,
+        [string]$Description,
+        [switch]$Required
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($RequestedPath)) {
+        $resolvedRequested = Resolve-ExistingDirectory -Path $RequestedPath
+        if (-not $resolvedRequested -or -not (& $Validator $resolvedRequested)) {
+            throw "$ParameterName does not point to a valid $Description root: $RequestedPath"
+        }
+
+        return $resolvedRequested
+    }
+
+    $searchRoots = @(
+        $PSScriptRoot,
+        (Split-Path -Parent $PSScriptRoot)
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
+
+    foreach ($searchRoot in $searchRoots) {
+        foreach ($candidateName in $CandidateDirectoryNames) {
+            $candidatePath = Join-Path $searchRoot $candidateName
+            $resolvedCandidate = Resolve-ExistingDirectory -Path $candidatePath
+            if (-not $resolvedCandidate) {
+                continue
+            }
+
+            if (& $Validator $resolvedCandidate) {
+                return $resolvedCandidate
+            }
+        }
+    }
+
+    if ($Required) {
+        $candidateText = $CandidateDirectoryNames -join ", "
+        throw "Could not find $Description beside the script. Expected one of: $candidateText. Pass -$ParameterName explicitly if your layout is different."
+    }
+
+    return $null
+}
+
+function Replace-KnownLibraryRoots {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Text
+    )
+
+    $updated = $Text
+    if (-not [string]::IsNullOrWhiteSpace($script:OldLibRootWindows)) {
+        $updated = $updated.Replace($script:OldLibRootWindows, $script:NewLibRootWindows)
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($script:OldLibRootForward)) {
+        $updated = $updated.Replace($script:OldLibRootForward, $script:NewLibRootForward)
+    }
+
+    return $updated
+}
+
+function Test-TextContainsKnownOldLibraryRoot {
+    param(
+        [string]$Text
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return $false
+    }
+
+    return (
+        (-not [string]::IsNullOrWhiteSpace($script:OldLibRootWindows) -and $Text -like "*$($script:OldLibRootWindows)*") -or
+        (-not [string]::IsNullOrWhiteSpace($script:OldLibRootForward) -and $Text -like "*$($script:OldLibRootForward)*")
+    )
 }
 
 function Get-RelativePath {
@@ -398,8 +529,7 @@ function Update-CsprojFile {
         if (
             $project -like "*BaseLib-StS2-master*Sts2PathDiscovery.props" -or
             $project -like "*BaseLib*Sts2PathDiscovery.props" -or
-            $project -like "*$($script:OldLibRootWindows)*" -or
-            $project -like "*$($script:OldLibRootForward)*"
+            (Test-TextContainsKnownOldLibraryRoot -Text $project)
         ) {
             $importNode.SetAttribute("Project", $newPropsReference)
             $changed = $true
@@ -460,8 +590,7 @@ function Update-SolutionFile {
     $solutionDirectory = Split-Path -Parent $File.FullName
     $newProjectReference = Get-RelativePath -FromDirectory $solutionDirectory -ToPath $NewLibCsprojPath
 
-    $updated = $updated.Replace($script:OldLibRootWindows, $script:NewLibRootWindows)
-    $updated = $updated.Replace($script:OldLibRootForward, $script:NewLibRootForward)
+    $updated = Replace-KnownLibraryRoots -Text $updated
     $updated = $updated.Replace("BaseLib.csproj", [System.IO.Path]::GetFileName($NewLibCsprojPath))
     $updated = $updated.Replace("BaseLib-StS2.csproj", [System.IO.Path]::GetFileName($NewLibCsprojPath))
     $updated = $updated.Replace("BaseLib-StS2-master\BaseLib.csproj", $newProjectReference)
@@ -494,8 +623,7 @@ function Update-XmlTextFile {
     $fileDirectory = Split-Path -Parent $File.FullName
     $newPropsReference = Get-RelativePath -FromDirectory $fileDirectory -ToPath $NewPropsPath
 
-    $updated = $updated.Replace($script:OldLibRootWindows, $script:NewLibRootWindows)
-    $updated = $updated.Replace($script:OldLibRootForward, $script:NewLibRootForward)
+    $updated = Replace-KnownLibraryRoots -Text $updated
     $updated = $updated.Replace("path\to\BaseLib-StS2-master\Sts2PathDiscovery.props", $newPropsReference)
     $updated = $updated.Replace("path/to/BaseLib-StS2-master/Sts2PathDiscovery.props", $newPropsReference.Replace("\", "/"))
     $updated = $updated.Replace("BaseLib.csproj", [System.IO.Path]::GetFileName($script:NewLibCsprojPath))
@@ -1966,8 +2094,19 @@ function Get-MigrationBuckets {
 }
 
 $ProjectRoot = Resolve-FullPath -Path $ProjectRoot
-$OldLibRoot = Resolve-FullPath -Path $OldLibRoot
-$NewLibRoot = Resolve-FullPath -Path $NewLibRoot
+$OldLibRoot = Get-BundledLibraryRoot `
+    -RequestedPath $OldLibRoot `
+    -CandidateDirectoryNames @("BaseLib-StS2-master", "BaseLib-StS2", "BaseLib") `
+    -Validator ${function:Test-IsBaseLibRoot} `
+    -ParameterName "OldLibRoot" `
+    -Description "BaseLib" 
+$NewLibRoot = Get-BundledLibraryRoot `
+    -RequestedPath $NewLibRoot `
+    -CandidateDirectoryNames @("STS2-RitsuLib-main", "STS2-RitsuLib") `
+    -Validator ${function:Test-IsRitsuLibRoot} `
+    -ParameterName "NewLibRoot" `
+    -Description "STS2-RitsuLib" `
+    -Required
 $effectiveGenerateLegacyHarmonyBootstrap = [bool]($GenerateLegacyHarmonyBootstrap -or $RewritePatchBootstrap)
 $effectiveGenerateMigrationSupport = [bool]($GenerateMigrationSupport -or $RewriteMigrationSupportUsings)
 
@@ -2001,7 +2140,7 @@ $script:CompatibilitySupportPath = $CompatibilitySupportPath
 $script:EffectiveMigrationSupport = $effectiveGenerateMigrationSupport
 
 $script:OldLibRootWindows = $OldLibRoot
-$script:OldLibRootForward = $OldLibRoot.Replace("\", "/")
+$script:OldLibRootForward = $(if ($OldLibRoot) { $OldLibRoot.Replace("\", "/") } else { $null })
 $script:NewLibRootWindows = $NewLibRoot
 $script:NewLibRootForward = $NewLibRoot.Replace("\", "/")
 $script:ChangedFiles = @{}
@@ -2147,7 +2286,7 @@ $reportLines.Add("")
 $reportLines.Add("## Dependency target")
 $reportLines.Add("")
 $reportLines.Add("- Project root: " + $ProjectRoot)
-$reportLines.Add("- Old library root: " + $OldLibRoot)
+$reportLines.Add("- Old library root: " + $(if ($OldLibRoot) { $OldLibRoot } else { "(not found beside script; only generic BaseLib replacements were applied)" }))
 $reportLines.Add("- New library root: " + $NewLibRoot)
 $reportLines.Add("- New project file: " + (Split-Path -Leaf $newLibCsproj.FullName))
 $reportLines.Add("- New manifest id: " + $newManifestId)

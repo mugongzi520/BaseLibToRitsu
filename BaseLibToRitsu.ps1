@@ -2,9 +2,9 @@
 param(
     [string]$ProjectRoot,
 
-    [string]$OldLibRoot = "D:\mod\ctf9\BaseLib-StS2-master",
+    [string]$OldLibRoot,
 
-    [string]$NewLibRoot = "D:\mod\ctf9\STS2-RitsuLib-main",
+    [string]$NewLibRoot,
 
     [string]$Configuration = "Release",
 
@@ -35,7 +35,7 @@ function Get-InteractiveProjectRoot {
         }
 
         $trimmed = $inputPath.Trim().Trim('"')
-        if (-not (Test-Path -LiteralPath $trimmed)) {
+        if (-not (Test-Path -LiteralPath $trimmed -PathType Container)) {
             Write-Host "路径不存在：$trimmed" -ForegroundColor Yellow
             continue
         }
@@ -51,6 +51,58 @@ function Resolve-ExistingPath {
     )
 
     return (Resolve-Path -LiteralPath $Path).Path
+}
+
+function Resolve-ExistingFile {
+    param(
+        [string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $null
+    }
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $null
+    }
+
+    return (Resolve-Path -LiteralPath $Path).Path
+}
+
+function Get-SettingsFilePath {
+    return Join-Path $PSScriptRoot "BaseLibToRitsu.settings.json"
+}
+
+function Get-ToolSettings {
+    $settingsPath = Get-SettingsFilePath
+    if (-not (Test-Path -LiteralPath $settingsPath -PathType Leaf)) {
+        return @{}
+    }
+
+    try {
+        $raw = Get-Content -LiteralPath $settingsPath -Raw
+        $parsed = $raw | ConvertFrom-Json -ErrorAction Stop
+        $settings = @{}
+        foreach ($property in $parsed.PSObject.Properties) {
+            $settings[$property.Name] = [string]$property.Value
+        }
+
+        return $settings
+    }
+    catch {
+        return @{}
+    }
+}
+
+function Save-ToolSettings {
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$Settings
+    )
+
+    $settingsPath = Get-SettingsFilePath
+    $json = $Settings | ConvertTo-Json -Depth 4
+    [System.IO.File]::WriteAllText($settingsPath, $json, [System.Text.UTF8Encoding]::new($false))
 }
 
 function Get-TargetProjectFile {
@@ -105,7 +157,7 @@ function Get-ProjectGodotPath {
     )
 
     $propsPath = Join-Path $Root "Sts2PathDiscovery.props"
-    if (-not (Test-Path -LiteralPath $propsPath)) {
+    if (-not (Test-Path -LiteralPath $propsPath -PathType Leaf)) {
         return $null
     }
 
@@ -119,50 +171,78 @@ function Get-ProjectGodotPath {
         return $null
     }
 
-    $candidate = $match.Groups["path"].Value.Trim()
-    return $(if (Test-Path -LiteralPath $candidate) { $candidate } else { $null })
+    return $match.Groups["path"].Value.Trim()
 }
 
-function Get-DiscoveredGodotPath {
+function Get-ConfiguredGodotPath {
     param(
         [Parameter(Mandatory)]
         [string]$Root,
-        [string]$RequestedPath
+        [string]$RequestedPath,
+        [bool]$Interactive
     )
 
-    if (-not [string]::IsNullOrWhiteSpace($RequestedPath)) {
-        if (-not (Test-Path -LiteralPath $RequestedPath)) {
-            throw "GodotPath does not exist: $RequestedPath"
-        }
+    $settings = Get-ToolSettings
+    $candidateSources = [System.Collections.Generic.List[object]]::new()
 
-        return (Resolve-Path -LiteralPath $RequestedPath).Path
+    if (-not [string]::IsNullOrWhiteSpace($RequestedPath)) {
+        $candidateSources.Add([pscustomobject]@{
+                Label = "命令行参数"
+                Path = $RequestedPath
+            })
     }
 
     $projectPath = Get-ProjectGodotPath -Root $Root
-    if ($projectPath) {
-        return (Resolve-Path -LiteralPath $projectPath).Path
+    if (-not [string]::IsNullOrWhiteSpace($projectPath)) {
+        $candidateSources.Add([pscustomobject]@{
+                Label = "项目 Sts2PathDiscovery.props"
+                Path = $projectPath
+            })
     }
 
-    $knownCandidates = @(
-        "D:\tools\Godot\4.5.1-mono\Godot_v4.5.1-stable_mono_win64\Godot_v4.5.1-stable_mono_win64.exe",
-        "D:\tools\Godot\4.5.1-mono\Godot_v4.5.1-stable_mono_win64\Godot_v4.5.1-stable_mono_win64_console.exe"
-    )
+    if ($settings.ContainsKey("GodotPath") -and -not [string]::IsNullOrWhiteSpace($settings["GodotPath"])) {
+        $candidateSources.Add([pscustomobject]@{
+                Label = "本地工具设置"
+                Path = $settings["GodotPath"]
+            })
+    }
 
-    foreach ($candidate in $knownCandidates) {
-        if (Test-Path -LiteralPath $candidate) {
-            return (Resolve-Path -LiteralPath $candidate).Path
+    foreach ($candidate in $candidateSources) {
+        $resolved = Resolve-ExistingFile -Path $candidate.Path
+        if (-not $resolved) {
+            continue
         }
+
+        if ($settings["GodotPath"] -ne $resolved) {
+            $settings["GodotPath"] = $resolved
+            Save-ToolSettings -Settings $settings
+        }
+
+        return $resolved
     }
 
-    $discovered = Get-ChildItem -LiteralPath "D:\tools\Godot" -Recurse -File -ErrorAction SilentlyContinue |
-        Where-Object {
-            $_.Name -like "Godot*_mono*_win64.exe" -and
-            $_.Name -notlike "*console.exe"
-        } |
-        Sort-Object FullName |
-        Select-Object -First 1
+    if (-not $Interactive) {
+        throw "找不到可用的 Godot Mono。请在项目的 Sts2PathDiscovery.props 里配置 GodotPath，或命令行传 -GodotPath，或先交互运行一次保存。"
+    }
 
-    return $(if ($discovered) { $discovered.FullName } else { $null })
+    while ($true) {
+        Write-Host ""
+        $inputPath = Read-Host "首次使用请输入 Godot Mono 可执行文件路径"
+        if ([string]::IsNullOrWhiteSpace($inputPath)) {
+            Write-Host "GodotPath 不能为空，请重新输入。" -ForegroundColor Yellow
+            continue
+        }
+
+        $resolved = Resolve-ExistingFile -Path $inputPath.Trim().Trim('"')
+        if (-not $resolved) {
+            Write-Host "GodotPath 不存在：$inputPath" -ForegroundColor Yellow
+            continue
+        }
+
+        $settings["GodotPath"] = $resolved
+        Save-ToolSettings -Settings $settings
+        return $resolved
+    }
 }
 
 try {
@@ -176,22 +256,33 @@ try {
 
     $projectRootFull = Resolve-ExistingPath -Path $ProjectRoot.Trim().Trim('"')
     $convertScriptPath = Join-Path $PSScriptRoot "Convert-BaseLibToRitsuLib.ps1"
-    if (-not (Test-Path -LiteralPath $convertScriptPath)) {
+    if (-not (Test-Path -LiteralPath $convertScriptPath -PathType Leaf)) {
         throw "Could not find converter script '$convertScriptPath'."
     }
 
     Write-Host ""
     Write-Host "==> Migrating BaseLib references in $projectRootFull"
-    & powershell -ExecutionPolicy Bypass -File $convertScriptPath `
-        -ProjectRoot $projectRootFull `
-        -OldLibRoot $OldLibRoot `
-        -NewLibRoot $NewLibRoot `
-        -Apply `
-        -RewriteSafeCode `
-        -RewritePatchBootstrap `
-        -GenerateMigrationSupport `
-        -RewriteMigrationSupportUsings `
-        -GenerateRitsuScaffold
+    $convertArguments = @(
+        "-ExecutionPolicy", "Bypass",
+        "-File", $convertScriptPath,
+        "-ProjectRoot", $projectRootFull,
+        "-Apply",
+        "-RewriteSafeCode",
+        "-RewritePatchBootstrap",
+        "-GenerateMigrationSupport",
+        "-RewriteMigrationSupportUsings",
+        "-GenerateRitsuScaffold"
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($OldLibRoot)) {
+        $convertArguments += @("-OldLibRoot", $OldLibRoot)
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($NewLibRoot)) {
+        $convertArguments += @("-NewLibRoot", $NewLibRoot)
+    }
+
+    & powershell @convertArguments
 
     if ($LASTEXITCODE -ne 0) {
         throw "converter script failed with exit code $LASTEXITCODE."
@@ -207,10 +298,7 @@ try {
     }
 
     if ($Publish) {
-        $resolvedGodotPath = Get-DiscoveredGodotPath -Root $projectRootFull -RequestedPath $GodotPath
-        if ([string]::IsNullOrWhiteSpace($resolvedGodotPath)) {
-            throw "Could not discover a usable Godot executable. Pass -GodotPath explicitly."
-        }
+        $resolvedGodotPath = Get-ConfiguredGodotPath -Root $projectRootFull -RequestedPath $GodotPath -Interactive $startedInteractive
 
         Write-Host ""
         Write-Host "==> Publishing with GodotPath=$resolvedGodotPath"
