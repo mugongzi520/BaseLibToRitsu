@@ -203,6 +203,15 @@ function Write-Utf8File {
     [System.IO.File]::WriteAllText($Path, $Content, $utf8NoBom)
 }
 
+function Normalize-LeadingUnicodePreamble {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Text
+    )
+
+    return [System.Text.RegularExpressions.Regex]::Replace($Text, '^[\uFEFF\u200B\u2060]+', '')
+}
+
 function Add-ChangedFile {
     param(
         [Parameter(Mandatory)]
@@ -1822,7 +1831,7 @@ function Update-CSharpMigrationSupportFile {
     )
 
     $original = Get-Content -LiteralPath $File.FullName -Raw
-    $updated = $original
+    $updated = Normalize-LeadingUnicodePreamble -Text $original
 
     $updated = [System.Text.RegularExpressions.Regex]::Replace(
         $updated,

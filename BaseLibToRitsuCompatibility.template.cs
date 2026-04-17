@@ -51,6 +51,11 @@ public interface ICustomModel
 {
 }
 
+public interface ITranscendenceCard
+{
+    CardModel GetTranscendenceTransformedCard();
+}
+
 public interface ISceneConversions
 {
     void RegisterSceneConversions();

@@ -245,6 +245,296 @@ function Get-ConfiguredGodotPath {
     }
 }
 
+function Invoke-ProjectBuild {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ProjectFile,
+        [Parameter(Mandatory)]
+        [string]$Configuration
+    )
+
+    Write-Host ""
+    Write-Host "==> Building $ProjectFile ($Configuration)"
+    & dotnet build $ProjectFile -c $Configuration
+    if ($LASTEXITCODE -ne 0) {
+        throw "dotnet build failed with exit code $LASTEXITCODE."
+    }
+}
+
+function Invoke-ProjectPublish {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ProjectFile,
+        [Parameter(Mandatory)]
+        [string]$Configuration,
+        [Parameter(Mandatory)]
+        [string]$GodotExecutablePath
+    )
+
+    Write-Host ""
+    Write-Host "==> Publishing with GodotPath=$GodotExecutablePath"
+    & dotnet publish $ProjectFile -c $Configuration /p:GodotPath=$GodotExecutablePath
+    if ($LASTEXITCODE -ne 0) {
+        throw "dotnet publish failed with exit code $LASTEXITCODE."
+    }
+}
+
+function Test-IsPathUnderRoot {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+        [Parameter(Mandatory)]
+        [string]$Root
+    )
+
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $fullRoot = [System.IO.Path]::GetFullPath($Root)
+    $rootWithSeparator = if ($fullRoot.EndsWith([System.IO.Path]::DirectorySeparatorChar) -or $fullRoot.EndsWith([System.IO.Path]::AltDirectorySeparatorChar)) {
+        $fullRoot
+    }
+    else {
+        $fullRoot + [System.IO.Path]::DirectorySeparatorChar
+    }
+
+    return $fullPath.Equals($fullRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $fullPath.StartsWith($rootWithSeparator, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Add-UniquePackageFile {
+    param(
+        [AllowEmptyCollection()]
+        [Parameter(Mandatory)]
+        [System.Collections.Generic.HashSet[string]]$FileSet,
+        [Parameter(Mandatory)]
+        [string]$Path,
+        [Parameter(Mandatory)]
+        [string]$ProjectRoot
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return
+    }
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return
+    }
+
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    if (-not (Test-IsPathUnderRoot -Path $fullPath -Root $ProjectRoot)) {
+        return
+    }
+
+    $null = $FileSet.Add($fullPath)
+}
+
+function Get-ChangedFilesFromReport {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ReportPath,
+        [Parameter(Mandatory)]
+        [string]$ProjectRoot
+    )
+
+    if (-not (Test-Path -LiteralPath $ReportPath -PathType Leaf)) {
+        return @()
+    }
+
+    $files = [System.Collections.Generic.List[string]]::new()
+    $inChangedFilesSection = $false
+
+    foreach ($line in Get-Content -LiteralPath $ReportPath) {
+        if ($line -eq "## Changed files") {
+            $inChangedFilesSection = $true
+            continue
+        }
+
+        if ($inChangedFilesSection -and $line -match '^## ') {
+            break
+        }
+
+        if (-not $inChangedFilesSection -or -not $line.StartsWith("- ")) {
+            continue
+        }
+
+        $candidate = $line.Substring(2)
+        $reasonSeparatorIndex = if ($candidate.Length -gt 3) { $candidate.IndexOf(": ", 3) } else { -1 }
+        $pathText = if ($reasonSeparatorIndex -gt 0) { $candidate.Substring(0, $reasonSeparatorIndex) } else { $candidate }
+
+        if (-not [string]::IsNullOrWhiteSpace($pathText) -and
+            (Test-Path -LiteralPath $pathText -PathType Leaf) -and
+            (Test-IsPathUnderRoot -Path $pathText -Root $ProjectRoot)) {
+            $files.Add([System.IO.Path]::GetFullPath($pathText))
+        }
+    }
+
+    return @($files | Select-Object -Unique)
+}
+
+function Get-ConversionPackageFiles {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ProjectRoot,
+        [Parameter(Mandatory)]
+        [string]$ReportPath
+    )
+
+    $rootFull = [System.IO.Path]::GetFullPath($ProjectRoot)
+    $files = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+    foreach ($changedFile in Get-ChangedFilesFromReport -ReportPath $ReportPath -ProjectRoot $rootFull) {
+        Add-UniquePackageFile -FileSet $files -Path $changedFile -ProjectRoot $rootFull
+    }
+
+    $rootPatterns = @(
+        "*.sln",
+        "*.csproj",
+        "*.props",
+        "*.targets",
+        "*.json",
+        "project.godot",
+        "export_presets.cfg",
+        "Directory.Build.props",
+        "Directory.Build.targets",
+        "NuGet.Config",
+        "base-lib-to-ritsu-report.md",
+        "ritsu-content-pack-scaffold.md"
+    )
+
+    foreach ($pattern in $rootPatterns) {
+        foreach ($file in Get-ChildItem -LiteralPath $rootFull -File -Filter $pattern -ErrorAction SilentlyContinue) {
+            Add-UniquePackageFile -FileSet $files -Path $file.FullName -ProjectRoot $rootFull
+        }
+    }
+
+    $generatedDir = Join-Path $rootFull "Generated\BaseLibToRitsu"
+    if (Test-Path -LiteralPath $generatedDir -PathType Container) {
+        foreach ($file in Get-ChildItem -LiteralPath $generatedDir -Recurse -File) {
+            Add-UniquePackageFile -FileSet $files -Path $file.FullName -ProjectRoot $rootFull
+        }
+    }
+
+    return @($files | Sort-Object)
+}
+
+function New-ConversionArchive {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ProjectRoot,
+        [Parameter(Mandatory)]
+        [string]$ReportPath
+    )
+
+    $rootFull = [System.IO.Path]::GetFullPath($ProjectRoot)
+    $projectName = Split-Path -Leaf $rootFull
+    $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $zipPath = Join-Path $rootFull ($projectName + "-BaseLibToRitsu-package-" + $timestamp + ".zip")
+    $stagingRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("BaseLibToRitsu-" + [System.Guid]::NewGuid().ToString("N"))
+    $files = @(Get-ConversionPackageFiles -ProjectRoot $rootFull -ReportPath $ReportPath)
+
+    if ($files.Count -eq 0) {
+        throw "没有可打包的转换结果。请先确认转换报告是否已生成。"
+    }
+
+    New-Item -ItemType Directory -Path $stagingRoot -Force | Out-Null
+
+    try {
+        foreach ($file in $files) {
+            $relativePath = $file.Substring($rootFull.Length).TrimStart('\', '/')
+            $destinationPath = Join-Path $stagingRoot $relativePath
+            $destinationDirectory = Split-Path -Parent $destinationPath
+            if (-not (Test-Path -LiteralPath $destinationDirectory)) {
+                New-Item -ItemType Directory -Path $destinationDirectory -Force | Out-Null
+            }
+
+            Copy-Item -LiteralPath $file -Destination $destinationPath -Force
+        }
+
+        $manifestLines = [System.Collections.Generic.List[string]]::new()
+        $manifestLines.Add("Project root: $rootFull")
+        $manifestLines.Add("Created: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
+        $manifestLines.Add("")
+        $manifestLines.Add("Included files:")
+        foreach ($file in $files) {
+            $manifestLines.Add("- " + $file.Substring($rootFull.Length).TrimStart('\', '/'))
+        }
+
+        $manifestPath = Join-Path $stagingRoot "_BaseLibToRitsuPackage.txt"
+        [System.IO.File]::WriteAllLines($manifestPath, $manifestLines, [System.Text.UTF8Encoding]::new($false))
+
+        if (Test-Path -LiteralPath $zipPath -PathType Leaf) {
+            Remove-Item -LiteralPath $zipPath -Force
+        }
+
+        $archiveInputs = @(Get-ChildItem -LiteralPath $stagingRoot -Force | Select-Object -ExpandProperty FullName)
+        Compress-Archive -LiteralPath $archiveInputs -DestinationPath $zipPath -Force
+
+        return [pscustomobject]@{
+            ZipPath   = $zipPath
+            FileCount = $files.Count
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $stagingRoot) {
+            Remove-Item -LiteralPath $stagingRoot -Recurse -Force
+        }
+    }
+}
+
+function Show-PostConversionMenu {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ProjectRoot,
+        [Parameter(Mandatory)]
+        [string]$ProjectFile,
+        [Parameter(Mandatory)]
+        [string]$Configuration,
+        [Parameter(Mandatory)]
+        [string]$ReportPath
+    )
+
+    while ($true) {
+        Write-Host ""
+        Write-Host "转换完成，接下来请选择：" -ForegroundColor Cyan
+        Write-Host "1. 编译测试"
+        Write-Host "2. 打包修改后的文件"
+        Write-Host "3. 退出"
+
+        $choice = (Read-Host "请输入选项编号").Trim()
+        switch ($choice) {
+            "1" {
+                try {
+                    Invoke-ProjectBuild -ProjectFile $ProjectFile -Configuration $Configuration
+                    Write-Host ""
+                    Write-Host "编译完成。" -ForegroundColor Green
+                }
+                catch {
+                    Write-Host ""
+                    Write-Host "编译失败：$($_.Exception.Message)" -ForegroundColor Red
+                }
+            }
+            "2" {
+                try {
+                    Write-Host ""
+                    Write-Host "==> Packaging converted files"
+                    $archive = New-ConversionArchive -ProjectRoot $ProjectRoot -ReportPath $ReportPath
+                    Write-Host "打包完成：$($archive.ZipPath)" -ForegroundColor Green
+                    Write-Host "打包文件数：$($archive.FileCount)" -ForegroundColor Green
+                }
+                catch {
+                    Write-Host ""
+                    Write-Host "打包失败：$($_.Exception.Message)" -ForegroundColor Red
+                }
+            }
+            "3" {
+                return
+            }
+            default {
+                Write-Host "请输入 1 / 2 / 3。" -ForegroundColor Yellow
+            }
+        }
+    }
+}
+
 try {
     Write-Host "BaseLibToRitsu 懒人版" -ForegroundColor Cyan
     Write-Host "直接输入项目路径即可开始转换。" -ForegroundColor Cyan
@@ -289,22 +579,17 @@ try {
     }
 
     $projectFile = Get-TargetProjectFile -Root $projectRootFull
+    $reportPath = Join-Path $projectRootFull "base-lib-to-ritsu-report.md"
 
-    Write-Host ""
-    Write-Host "==> Building $projectFile ($Configuration)"
-    & dotnet build $projectFile -c $Configuration
-    if ($LASTEXITCODE -ne 0) {
-        throw "dotnet build failed with exit code $LASTEXITCODE."
+    if ($startedInteractive) {
+        Show-PostConversionMenu -ProjectRoot $projectRootFull -ProjectFile $projectFile -Configuration $Configuration -ReportPath $reportPath
     }
+    else {
+        Invoke-ProjectBuild -ProjectFile $projectFile -Configuration $Configuration
 
-    if ($Publish) {
-        $resolvedGodotPath = Get-ConfiguredGodotPath -Root $projectRootFull -RequestedPath $GodotPath -Interactive $startedInteractive
-
-        Write-Host ""
-        Write-Host "==> Publishing with GodotPath=$resolvedGodotPath"
-        & dotnet publish $projectFile -c $Configuration /p:GodotPath=$resolvedGodotPath
-        if ($LASTEXITCODE -ne 0) {
-            throw "dotnet publish failed with exit code $LASTEXITCODE."
+        if ($Publish) {
+            $resolvedGodotPath = Get-ConfiguredGodotPath -Root $projectRootFull -RequestedPath $GodotPath -Interactive $false
+            Invoke-ProjectPublish -ProjectFile $projectFile -Configuration $Configuration -GodotExecutablePath $resolvedGodotPath
         }
     }
 
