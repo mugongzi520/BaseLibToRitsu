@@ -1173,7 +1173,45 @@ function Get-SanitizedCSharpText {
         }
 
         if ($current -eq '"') {
-            $isVerbatimString = $index -gt 0 -and $chars[$index - 1] -eq "@"
+            $quoteRunLength = 0
+            while ($index + $quoteRunLength -lt $length -and $chars[$index + $quoteRunLength] -eq '"') {
+                $quoteRunLength++
+            }
+
+            if ($quoteRunLength -ge 3) {
+                for ($quoteIndex = 0; $quoteIndex -lt $quoteRunLength; $quoteIndex++) {
+                    $chars[$index + $quoteIndex] = " "
+                }
+                $index += $quoteRunLength
+
+                while ($index -lt $length) {
+                    if ($chars[$index] -eq '"') {
+                        $closingQuoteRunLength = 0
+                        while ($index + $closingQuoteRunLength -lt $length -and $chars[$index + $closingQuoteRunLength] -eq '"') {
+                            $closingQuoteRunLength++
+                        }
+
+                        if ($closingQuoteRunLength -ge $quoteRunLength) {
+                            for ($quoteIndex = 0; $quoteIndex -lt $closingQuoteRunLength; $quoteIndex++) {
+                                $chars[$index + $quoteIndex] = " "
+                            }
+                            $index += $closingQuoteRunLength
+                            break
+                        }
+                    }
+
+                    if ($chars[$index] -ne "`r" -and $chars[$index] -ne "`n") {
+                        $chars[$index] = " "
+                    }
+                    $index++
+                }
+
+                continue
+            }
+
+            $isVerbatimString =
+                ($index -gt 0 -and $chars[$index - 1] -eq "@") -or
+                ($index -gt 1 -and $chars[$index - 1] -eq "$" -and $chars[$index - 2] -eq "@")
             $chars[$index] = " "
             $index++
 
@@ -1292,7 +1330,8 @@ function Find-MatchingDelimiter {
 function Get-CSharpNamespaceMetadata {
     param(
         [Parameter(Mandatory)]
-        [string]$Text
+        [string]$Text,
+        [string]$SourcePath
     )
 
     $namespaceRegex = [System.Text.RegularExpressions.Regex]::new(
@@ -1308,7 +1347,16 @@ function Get-CSharpNamespaceMetadata {
         }
         else {
             $openBraceIndex = $match.Index + $match.Value.LastIndexOf("{")
-            Find-MatchingDelimiter -Text $Text -OpenIndex $openBraceIndex -OpenChar "{" -CloseChar "}"
+            try {
+                Find-MatchingDelimiter -Text $Text -OpenIndex $openBraceIndex -OpenChar "{" -CloseChar "}"
+            }
+            catch {
+                if (-not [string]::IsNullOrWhiteSpace($SourcePath)) {
+                    throw "Failed to parse namespace block in '$SourcePath': $($_.Exception.Message)"
+                }
+
+                throw
+            }
         }
 
         $spans.Add([pscustomobject]@{
@@ -1400,7 +1448,7 @@ function Get-ClassMetadata {
     foreach ($file in Get-ProjectFiles -Root $Root -Filter "*.cs") {
         $text = Get-Content -LiteralPath $file.FullName -Raw
         $sanitizedText = Get-SanitizedCSharpText -Text $text
-        $namespaceSpans = Get-CSharpNamespaceMetadata -Text $sanitizedText
+        $namespaceSpans = Get-CSharpNamespaceMetadata -Text $sanitizedText -SourcePath $file.FullName
 
         foreach ($match in $classRegex.Matches($sanitizedText)) {
             $name = $match.Groups["name"].Value
